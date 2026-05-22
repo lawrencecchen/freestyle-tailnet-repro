@@ -14,7 +14,15 @@ Result:
 
 ```text
 kernel=Linux ... 6.1.0-8-freestyle ...
+devtmpfs is mounted at /dev
+Seccomp: 0
+NoNewPrivs: 0
 Bounding set = ... cap_net_admin ... cap_sys_module ... cap_mknod ...
+kernel config TUN entries: no output from /proc/config.gz, /boot/config-$(uname -r), or /lib/modules/.../build/.config
+ls: cannot access '/lib/modules/6.1.0-8-freestyle': No such file or directory
+registered char devices:
+/proc/devices: 10 misc
+no tun entry in /proc/misc
 modprobe: FATAL: Module tun not found in directory /lib/modules/6.1.0-8-freestyle
 crw-rw-rw- 1 root root 10, 200 ... /dev/net/tun
 ip tuntap:
@@ -24,6 +32,12 @@ KERNEL_TUN_FAILED
 ```
 
 Interpretation: the process has the relevant capabilities, and the device node can be created, but the kernel does not expose a usable TUN device.
+
+More specifically, this looks like the TUN driver is not registered in the running guest kernel:
+
+- If `CONFIG_TUN=y`, `/proc/misc` should normally contain `tun`, and opening a manually-created `/dev/net/tun` char device should not return `ENODEV`.
+- If `CONFIG_TUN=m`, then the matching module tree for `6.1.0-8-freestyle` appears missing inside the VM, so `modprobe tun` cannot load it.
+- This does not look like a seccomp or Linux capability denial: `Seccomp: 0`, `NoNewPrivs: 0`, and the bounding set includes `cap_net_admin`, `cap_sys_module`, and `cap_mknod`.
 
 ## Managed Tailscale
 
