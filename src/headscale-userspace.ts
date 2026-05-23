@@ -11,6 +11,7 @@ import {
 requireFreestyleApiKey();
 
 const runId = `fs-hs-${Date.now().toString(36)}`;
+const tailnetMode = process.env.TAILSCALE_MODE === "kernel" ? "kernel" : "userspace";
 const client = freestyleClient();
 const vmIds: string[] = [];
 
@@ -41,11 +42,11 @@ try {
 
   const [a, b] = await Promise.all([
     client.vms.create({
-      aptDeps: ["bash", "ca-certificates", "curl", "iproute2"],
+      aptDeps: ["bash", "ca-certificates", "curl", "iproute2", "python3"],
       idleTimeoutSeconds: 300,
     }),
     client.vms.create({
-      aptDeps: ["bash", "ca-certificates", "curl", "iproute2"],
+      aptDeps: ["bash", "ca-certificates", "curl", "iproute2", "python3"],
       idleTimeoutSeconds: 300,
     }),
   ]);
@@ -53,10 +54,10 @@ try {
   console.log(`worker_a=${a.vm.vmId}`);
   console.log(`worker_b=${b.vm.vmId}`);
 
-  console.log("\n== workers join headscale using tailscaled userspace networking ==");
+  console.log(`\n== workers join headscale using tailscaled ${tailnetMode} networking ==`);
   const [joinA, joinB] = await Promise.all([
-    execText(a.vm, joinHeadscaleScript(controlUrl, authKey, `${runId}-a`), 180_000),
-    execText(b.vm, joinHeadscaleScript(controlUrl, authKey, `${runId}-b`), 180_000),
+    execText(a.vm, joinHeadscaleScript(controlUrl, authKey, `${runId}-a`, tailnetMode), 180_000),
+    execText(b.vm, joinHeadscaleScript(controlUrl, authKey, `${runId}-b`, tailnetMode), 180_000),
   ]);
   console.log("[a]\n" + redact(joinA));
   console.log("[b]\n" + redact(joinB));
@@ -76,11 +77,33 @@ try {
   console.log("[a -> b]\n" + redact(pingAtoB));
   console.log("[b -> a]\n" + redact(pingBtoA));
 
+  let tcpAtoB = "";
+  let tcpBtoA = "";
+  if (tailnetMode === "kernel") {
+    console.log("\n== worker-to-worker TCP over tailnet IP ==");
+    const [serverA, serverB] = await Promise.all([
+      execText(a.vm, httpServerScript("a"), 30_000),
+      execText(b.vm, httpServerScript("b"), 30_000),
+    ]);
+    console.log("[server a]\n" + redact(serverA));
+    console.log("[server b]\n" + redact(serverB));
+    [tcpAtoB, tcpBtoA] = await Promise.all([
+      execText(a.vm, curlPeerScript(ipB), 60_000),
+      execText(b.vm, curlPeerScript(ipA), 60_000),
+    ]);
+    console.log("[a -> b http]\n" + redact(tcpAtoB));
+    console.log("[b -> a http]\n" + redact(tcpBtoA));
+  }
+
   console.log("\nsummary:");
+  console.log(`tailnet_mode=${tailnetMode}`);
   console.log(`headscale_health=${health.includes("ok") ? "yes" : "no"}`);
   console.log(`headscale_join=${/HEADSCALE_UP_OK/.test(joinA) && /HEADSCALE_UP_OK/.test(joinB) ? "yes" : "no"}`);
   console.log(`headscale_ping=${/pong/.test(pingAtoB) && /pong/.test(pingBtoA) ? "yes" : "no"}`);
   console.log(`direct_peer_connection=${/direct connection not established/.test(pingAtoB + pingBtoA) ? "no" : "maybe"}`);
+  if (tailnetMode === "kernel") {
+    console.log(`tailnet_tcp=${/hello-from-b/.test(tcpAtoB) && /hello-from-a/.test(tcpBtoA) ? "yes" : "no"}`);
+  }
 } finally {
   await deleteVms(client, vmIds);
 }
@@ -193,7 +216,27 @@ headscale -c /etc/headscale/config.yaml preauthkeys create --user 1 --reusable -
 `);
 }
 
-function joinHeadscaleScript(controlUrl: string, authKey: string, hostname: string): string {
+function joinHeadscaleScript(
+  controlUrl: string,
+  authKey: string,
+  hostname: string,
+  mode: "kernel" | "userspace",
+): string {
+  const daemonArgs =
+    mode === "userspace"
+      ? "--tun=userspace-networking --socks5-server=127.0.0.1:1055 --outbound-http-proxy-listen=127.0.0.1:1055"
+      : "";
+  const readinessCheck =
+    mode === "userspace"
+      ? "ss -ltn | grep -q ':1055 '"
+      : "test -S /tmp/freestyle-repro-ts/tailscaled.sock";
+  const postJoinDiagnostics =
+    mode === "kernel"
+      ? String.raw`
+ip addr show tailscale0 2>&1 || true
+ip route show table all | grep -E 'tailscale0|100\\.64\\.' || true
+`
+      : "";
   return bashScript(`
 set -u
 if ! command -v tailscaled >/dev/null 2>&1; then
@@ -203,9 +246,9 @@ pkill tailscaled >/dev/null 2>&1 || true
 pgrep tailscaled >/dev/null 2>&1 && pkill -9 tailscaled >/dev/null 2>&1 || true
 rm -rf /tmp/freestyle-repro-ts
 mkdir -p /tmp/freestyle-repro-ts
-tailscaled --state=/tmp/freestyle-repro-ts/state --socket=/tmp/freestyle-repro-ts/tailscaled.sock --tun=userspace-networking --socks5-server=127.0.0.1:1055 --outbound-http-proxy-listen=127.0.0.1:1055 >/tmp/freestyle-repro-ts/tailscaled.log 2>&1 &
+tailscaled --state=/tmp/freestyle-repro-ts/state --socket=/tmp/freestyle-repro-ts/tailscaled.sock ${daemonArgs} >/tmp/freestyle-repro-ts/tailscaled.log 2>&1 &
 for i in $(seq 1 120); do
-  if ss -ltn | grep -q ':1055 '; then
+  if ${readinessCheck}; then
     break
   fi
   sleep 0.25
@@ -221,6 +264,7 @@ fi
 echo HEADSCALE_UP_OK
 tailscale --socket=/tmp/freestyle-repro-ts/tailscaled.sock ip -4 | head -1 | sed 's/^/TAILSCALE_IP=/'
 tailscale --socket=/tmp/freestyle-repro-ts/tailscaled.sock status
+${postJoinDiagnostics}
 `);
 }
 
@@ -239,4 +283,53 @@ function extractHeadscaleKey(text: string): string | null {
 
 function extractTailscaleIp(text: string): string | null {
   return text.match(/TAILSCALE_IP=([0-9.]+)/)?.[1] ?? null;
+}
+
+function httpServerScript(label: string): string {
+  return bashScript(`
+set -u
+pkill -f '[p]ython3 -m http.server 18081' >/dev/null 2>&1 || true
+mkdir -p /tmp/freestyle-peer
+printf 'hello-from-${label}\\n' > /tmp/freestyle-peer/index.html
+python3 - <<'PY'
+import os
+
+pid = os.fork()
+if pid == 0:
+    os.setsid()
+    os.chdir("/tmp/freestyle-peer")
+    with open("/dev/null", "rb", buffering=0) as stdin, open("/tmp/freestyle-peer/http.log", "ab", buffering=0) as out:
+        os.dup2(stdin.fileno(), 0)
+        os.dup2(out.fileno(), 1)
+        os.dup2(out.fileno(), 2)
+        os.execlp("python3", "python3", "-m", "http.server", "18081", "--bind", "0.0.0.0")
+print(f"HTTP_SERVER_PID={pid}")
+PY
+for i in $(seq 1 80); do
+  if curl -fsS http://127.0.0.1:18081/ >/tmp/freestyle-peer/local.out 2>/tmp/freestyle-peer/local.err; then
+    echo HTTP_SERVER_OK
+    cat /tmp/freestyle-peer/local.out
+    exit 0
+  fi
+  sleep 0.25
+done
+echo HTTP_SERVER_FAILED
+cat /tmp/freestyle-peer/http.log /tmp/freestyle-peer/local.err 2>/dev/null || true
+exit 0
+`);
+}
+
+function curlPeerScript(peerIp: string): string {
+  return bashScript(`
+set -u
+for i in $(seq 1 80); do
+  if curl -fsS --max-time 3 http://${shellSingleQuote(peerIp).slice(1, -1)}:18081/; then
+    echo PEER_CURL_OK
+    exit 0
+  fi
+  sleep 0.5
+done
+echo PEER_CURL_FAILED
+exit 0
+`);
 }

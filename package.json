@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "tun": "tsx src/tun-check.ts",
-    "headscale": "tsx src/headscale-userspace.ts"
+    "headscale": "tsx src/headscale-userspace.ts",
+    "headscale:kernel": "TAILSCALE_MODE=kernel tsx src/headscale-userspace.ts"
   },
   "dependencies": {
     "freestyle": "0.1.51"

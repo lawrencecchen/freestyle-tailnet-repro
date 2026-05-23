@@ -2,9 +2,9 @@
 
 This repo is a minimal reproduction for Freestyle VM networking behavior with Tailscale and Headscale.
 
-The main issue: Freestyle VMs can run `tailscaled` in userspace mode, and Headscale can run on a Freestyle VM, but normal kernel TUN networking does not appear to be available. That prevents a standard `tailscale0` interface and normal VM-to-VM service networking.
+The original issue: Freestyle VMs could run `tailscaled` in userspace mode, and Headscale could run on a Freestyle VM, but normal kernel TUN networking was not available. That prevented a standard `tailscale0` interface and normal VM-to-VM service networking.
 
-Observed on May 22, 2026:
+Observed on May 22, 2026 before Freestyle's kernel fix:
 
 - `/dev/net/tun` is absent by default.
 - Creating `/dev/net/tun` with `mknod` succeeds, but `TUNSETIFF` fails with `OSError: [Errno 19] No such device`.
@@ -16,6 +16,13 @@ Observed on May 22, 2026:
 - `tailscale ping` succeeds through DERP.
 - Direct peer connection is not established.
 
+Retested on May 23, 2026 after Freestyle's kernel fix:
+
+- `npm run tun` now reports `kernel_tun=yes`.
+- `npm run headscale:kernel` creates real `tailscale0` interfaces on two worker VMs.
+- Plain HTTP over the 100.64.x tailnet IPs works both directions.
+- Direct peer connection still does not establish, expected until arbitrary UDP support lands.
+
 ## Run
 
 ```bash
@@ -23,12 +30,11 @@ npm install
 export FREESTYLE_API_KEY=...
 npm run tun
 npm run headscale
+npm run headscale:kernel
 ```
 
 Both scripts create disposable Freestyle VMs and delete them in `finally` blocks.
 
-## Expected question for Freestyle
+## Current question for Freestyle
 
-Can Freestyle VMs support `/dev/net/tun` and the kernel support needed for Tailscale/WireGuard-style interfaces?
-
-If not, is the recommended product architecture to use userspace networking plus app-level proxies/relays rather than normal tailnet interfaces?
+Is DERP-relayed TCP over kernel TUN a supported temporary path until arbitrary UDP or the VPC API ships?
