@@ -1,4 +1,5 @@
 import {
+  createVm,
   deleteVms,
   execText,
   freestyleClient,
@@ -10,14 +11,17 @@ requireFreestyleApiKey();
 
 const client = freestyleClient();
 const vmIds: string[] = [];
+let cleanupStarted = false;
+
+installSignalCleanup();
 
 try {
-  const created = await client.vms.create({
+  const created = await createVm(client, {
     aptDeps: ["bash", "ca-certificates", "curl", "iproute2", "kmod", "libcap2-bin", "python3"],
     idleTimeoutSeconds: 300,
   });
-  vmIds.push(created.vm.vmId);
-  console.log(`vm=${created.vm.vmId}`);
+  vmIds.push(created.vmId);
+  console.log(`vm=${created.vmId}`);
 
   const result = await execText(created.vm, tunProbeScript(), 180_000);
   console.log(redact(result));
@@ -25,7 +29,33 @@ try {
   console.log("\nsummary:");
   console.log(`kernel_tun=${/KERNEL_TUN_OK/.test(result) ? "yes" : "no"}`);
 } finally {
+  await cleanupResources();
+}
+
+async function cleanupResources(): Promise<void> {
+  if (cleanupStarted) return;
+  cleanupStarted = true;
+  process.removeListener("SIGINT", onSigint);
+  process.removeListener("SIGTERM", onSigterm);
   await deleteVms(client, vmIds);
+}
+
+async function cleanupAndExit(code: number): Promise<void> {
+  await cleanupResources();
+  process.exit(code);
+}
+
+function installSignalCleanup(): void {
+  process.once("SIGINT", onSigint);
+  process.once("SIGTERM", onSigterm);
+}
+
+function onSigint(): void {
+  void cleanupAndExit(130);
+}
+
+function onSigterm(): void {
+  void cleanupAndExit(143);
 }
 
 function tunProbeScript(): string {

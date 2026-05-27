@@ -1,5 +1,6 @@
 import {
   bashScript,
+  createVm,
   deleteVms,
   execText,
   freestyleClient,
@@ -14,16 +15,19 @@ const runId = `fs-hs-${Date.now().toString(36)}`;
 const tailnetMode = process.env.TAILSCALE_MODE === "kernel" ? "kernel" : "userspace";
 const client = freestyleClient();
 const vmIds: string[] = [];
+let cleanupStarted = false;
+
+installSignalCleanup();
 
 try {
-  const control = await client.vms.create({
+  const control = await createVm(client, {
     aptDeps: ["bash", "ca-certificates", "curl", "iproute2", "jq"],
     ports: [{ port: 443, targetPort: 18080 }],
     idleTimeoutSeconds: 600,
   });
-  vmIds.push(control.vm.vmId);
-  const controlUrl = `https://${control.vm.vmId}.vm.freestyle.sh`;
-  console.log(`control_vm=${control.vm.vmId}`);
+  vmIds.push(control.vmId);
+  const controlUrl = `https://${control.vmId}.vm.freestyle.sh`;
+  console.log(`control_vm=${control.vmId}`);
   console.log(`control_url=${controlUrl}`);
 
   console.log("\n== start headscale control VM ==");
@@ -40,19 +44,18 @@ try {
   const authKey = extractHeadscaleKey(keyOut);
   if (!authKey) throw new Error("failed to extract Headscale preauth key");
 
-  const [a, b] = await Promise.all([
-    client.vms.create({
+  const [a, b] = await createVmPair([
+    createTrackedVm({
       aptDeps: ["bash", "ca-certificates", "curl", "iproute2", "python3"],
       idleTimeoutSeconds: 300,
     }),
-    client.vms.create({
+    createTrackedVm({
       aptDeps: ["bash", "ca-certificates", "curl", "iproute2", "python3"],
       idleTimeoutSeconds: 300,
     }),
   ]);
-  vmIds.push(a.vm.vmId, b.vm.vmId);
-  console.log(`worker_a=${a.vm.vmId}`);
-  console.log(`worker_b=${b.vm.vmId}`);
+  console.log(`worker_a=${a.vmId}`);
+  console.log(`worker_b=${b.vmId}`);
 
   console.log(`\n== workers join headscale using tailscaled ${tailnetMode} networking ==`);
   const [joinA, joinB] = await Promise.all([
@@ -105,7 +108,54 @@ try {
     console.log(`tailnet_tcp=${/hello-from-b/.test(tcpAtoB) && /hello-from-a/.test(tcpBtoA) ? "yes" : "no"}`);
   }
 } finally {
+  await cleanupResources();
+}
+
+async function createTrackedVm(options: Parameters<typeof createVm>[1]): ReturnType<typeof createVm> {
+  const created = await createVm(client, options);
+  vmIds.push(created.vmId);
+  return created;
+}
+
+async function createVmPair<T>(promises: [Promise<T>, Promise<T>]): Promise<[T, T]> {
+  const results = await Promise.allSettled(promises);
+  const failures = results
+    .map((result, index) => result.status === "rejected" ? `worker_${index === 0 ? "a" : "b"}: ${errorMessage(result.reason)}` : null)
+    .filter((message): message is string => Boolean(message));
+  if (failures.length > 0) {
+    throw new Error(`Failed to create Headscale worker VMs: ${failures.join("; ")}`);
+  }
+  return results.map((result) => (result as PromiseFulfilledResult<T>).value) as [T, T];
+}
+
+function errorMessage(reason: unknown): string {
+  return reason instanceof Error ? reason.message : String(reason);
+}
+
+async function cleanupResources(): Promise<void> {
+  if (cleanupStarted) return;
+  cleanupStarted = true;
+  process.removeListener("SIGINT", onSigint);
+  process.removeListener("SIGTERM", onSigterm);
   await deleteVms(client, vmIds);
+}
+
+async function cleanupAndExit(code: number): Promise<void> {
+  await cleanupResources();
+  process.exit(code);
+}
+
+function installSignalCleanup(): void {
+  process.once("SIGINT", onSigint);
+  process.once("SIGTERM", onSigterm);
+}
+
+function onSigint(): void {
+  void cleanupAndExit(130);
+}
+
+function onSigterm(): void {
+  void cleanupAndExit(143);
 }
 
 async function waitForHeadscale(controlUrl: string): Promise<string> {

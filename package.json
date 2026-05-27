@@ -6,10 +6,12 @@
   "scripts": {
     "tun": "tsx src/tun-check.ts",
     "headscale": "tsx src/headscale-userspace.ts",
-    "headscale:kernel": "TAILSCALE_MODE=kernel tsx src/headscale-userspace.ts"
+    "headscale:kernel": "TAILSCALE_MODE=kernel tsx src/headscale-userspace.ts",
+    "vpc": "tsx src/vpc.ts",
+    "vpc:vpn": "tsx src/vpc-vpn.ts"
   },
   "dependencies": {
-    "freestyle": "0.1.51"
+    "freestyle": "0.1.55"
   },
   "devDependencies": {
     "@types/node": "^22.15.21",

@@ -1,6 +1,23 @@
+import { randomBytes } from "node:crypto";
+
 import { Freestyle } from "freestyle";
 
 export type VmHandle = Awaited<ReturnType<InstanceType<typeof Freestyle>["vms"]["create"]>>["vm"];
+export type VmCreateResult = Awaited<ReturnType<InstanceType<typeof Freestyle>["vms"]["create"]>> & {
+  vmId: string;
+};
+
+export type VmCreateOptionsCompat = NonNullable<Parameters<InstanceType<typeof Freestyle>["vms"]["create"]>[0]> & {
+  aptDeps?: string[];
+  ports?: { port: number; targetPort: number }[];
+  nics?: {
+    default?: boolean;
+    vpc: string;
+    mode: "routed";
+    ipv4: string;
+  }[];
+  persistence?: { type: "ephemeral" | "sticky" | "persistent"; priority?: number };
+};
 
 type ExecResult = {
   statusCode?: number;
@@ -23,6 +40,25 @@ export function freestyleClient(): Freestyle {
         signal: AbortSignal.timeout(15 * 60 * 1000),
       }),
   });
+}
+
+export async function createVm(client: Freestyle, options: VmCreateOptionsCompat = {}): Promise<VmCreateResult> {
+  const response = await client.fetch("/v1/vms", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(options),
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to create VM: ${response.status} ${await response.text()}`);
+  }
+  const body = await response.json() as { id: string; domains?: string[] };
+  const { vm } = await client.vms.get({ vmId: body.id });
+  return {
+    ...body,
+    vm,
+    vmId: body.id,
+    domains: body.domains ?? [],
+  };
 }
 
 export async function execText(vm: VmHandle, command: string, timeoutMs: number): Promise<string> {
@@ -50,6 +86,11 @@ export function bashScript(script: string): string {
   return `bash -lc ${shellSingleQuote(script)}`;
 }
 
+export function randomPrivateCidr24(): string {
+  const bytes = randomBytes(2);
+  return `10.${64 + (bytes[0] % 64)}.${bytes[1]}.0/24`;
+}
+
 export function redact(value: string): string {
   return value
     .replace(/hskey-[A-Za-z0-9_-]+/g, "hskey-redacted")
@@ -61,11 +102,29 @@ export async function deleteVms(client: Freestyle, vmIds: string[]): Promise<voi
   await Promise.all(
     vmIds.map(async (vmId) => {
       try {
-        await client.vms.ref({ vmId }).delete();
+        await client.vms.delete({ vmId });
         console.log(`deleted VM ${vmId}`);
       } catch (err) {
         console.log(`failed to delete VM ${vmId}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }),
   );
+}
+
+export async function deleteVpcBestEffort(client: Freestyle, vpcId: string | null): Promise<void> {
+  if (!vpcId) return;
+  try {
+    const response = await client.fetch(`/v1/vpcs/${vpcId}`, { method: "DELETE" });
+    if (response.ok) {
+      console.log(`deleted VPC ${vpcId}`);
+      return;
+    }
+    if (response.status === 404) {
+      console.log(`VPC delete endpoint unavailable for ${vpcId}: status=404`);
+      return;
+    }
+    console.log(`failed to delete VPC ${vpcId}: status=${response.status} body=${await response.text()}`);
+  } catch (err) {
+    console.log(`failed to delete VPC ${vpcId}: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }

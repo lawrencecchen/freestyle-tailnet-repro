@@ -1,6 +1,6 @@
 # Findings
 
-Date: May 23, 2026
+Date: May 26, 2026
 
 ## Kernel TUN
 
@@ -149,8 +149,92 @@ What cmux does not need on day one:
 
 This means the current kernel TUN fix plus DERP-relayed traffic appears sufficient for a temporary cmux implementation. A future Freestyle VPC API would probably be a cleaner long-term fit if it provides simple VM-to-VM private TCP routing and service discovery without cmux running its own Headscale control VM.
 
+## Freestyle Built-In VPC Retest
+
+Docs:
+
+- VPCs: `https://www.freestyle.sh/docs/vms/network/vpcs`
+- VPNs: `https://www.freestyle.sh/docs/vms/network/vpns`
+
+Command:
+
+```bash
+npm run vpc
+```
+
+Result:
+
+```text
+vpc_id=vpc_f3b3da67cc37446692b056c8feaf8d5c
+vpc_cidr=10.95.231.0/24
+worker_a_private_ip=10.95.231.10
+worker_b_private_ip=10.95.231.11
+worker_a_domains=0
+worker_b_domains=0
+PRIVATE_IP_PRESENT
+PING_OK
+PEER_CURL_OK
+summary:
+vpc_private_ip_present=yes
+vpc_ping=yes
+vpc_tcp=yes
+```
+
+Notes:
+
+- This path uses Freestyle's built-in VPC API only. It does not use Headscale, Tailscale, DERP, kernel TUN, or arbitrary UDP.
+- VMs are created with `nics: [{ default: true, vpc, mode: "routed", ipv4 }]`.
+- Each VM gets a routed private VLAN interface such as `eth0.1849@eth0`.
+- The VPC route appears inside the VM as `10.95.231.0/24 dev eth0.1849`.
+- VM-to-VM ICMP works with sub-millisecond to low-millisecond latency in this test.
+- VM-to-VM TCP works both directions:
+  - worker A curls `http://10.95.231.11:18081/` and receives `hello-from-b`
+  - worker B curls `http://10.95.231.10:18081/` and receives `hello-from-a`
+- No public VM domains are returned when the VMs are created with `ports: []`.
+- The script now defaults to a random private `/24` because the current API does not let this repro delete old VPCs. Reusing the original fixed `192.168.250.0/24` after a previous VPC remained caused both VM creates to fail with backend `500`.
+
+Current rough edges:
+
+- `vms.create({ nics, aptDeps })` returned a backend `500`. Creating the VMs with `nics` first, then installing packages inside the VM with `apt-get`, worked.
+- `DELETE /v1/vpcs/:vpcId` returned `404`; `GET /v1/vpcs` returned `405`. The current SDK exposes VPC create and WireGuard methods but no VPC delete/list methods.
+
+## Freestyle Built-In VPC VPN Retest
+
+Command:
+
+```bash
+FREESTYLE_VPN_PRINT_ONLY=1 npm run vpc:vpn
+```
+
+Result:
+
+```text
+vpc_id=vpc_e8bbb70de42c41b5b678e25289a974e6
+vpc_cidr=10.89.151.0/24
+vm_private_ip=10.89.151.10
+HTTP_SERVER_OK
+hello-from-vpc-vpn
+vpn_session=yw6U7eFY
+wireguard_interface=fsvpcnkaxr9
+client_tunnel_ip=100.97.151.154
+allowed_ips=10.89.151.0/24
+vpn_config_written=yes
+```
+
+Notes:
+
+- `vpc.wireguard.createEphemeral()` successfully returns a standard WireGuard client config and session ID.
+- The demo writes the config to an exclusive file with `0600` permissions inside a unique temp directory, uses a short basename for `wg-quick`'s interface-name limit, registers signal cleanup before remote allocation, closes the Freestyle ephemeral session on exit, and removes the config file.
+- This machine cannot bring the tunnel up non-interactively right now: `wg-quick` is not installed and `sudo -n true` fails. On a machine with `wireguard-tools` and noninteractive sudo, run:
+
+```bash
+FREESTYLE_VPN_UP=1 npm run vpc:vpn
+```
+
 ## Questions For Freestyle
 
-1. Is the CONNMARK/iptables warning expected or worth fixing for Tailscale health?
-2. Is internal port `8080` intentionally occupied on base VMs?
-3. Until arbitrary UDP or the VPC API ships, is DERP-relayed TCP over kernel TUN a supported temporary path?
+1. Is there a VPC delete/lifecycle API, or are VPCs expected to be persistent account resources for now?
+2. Should `vms.create({ nics, aptDeps })` work, or should cmux create VPC-attached VMs first and install packages afterward?
+3. Is `vpc.wireguard.createEphemeral()` the intended cmux desktop-to-VPC integration point while a workspace is open?
+4. Is the CONNMARK/iptables warning expected or worth fixing for Tailscale health?
+5. Is internal port `8080` intentionally occupied on base VMs?
